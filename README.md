@@ -2,6 +2,8 @@ a silly project made just for fun
 uploaded this because a friend of mine wanted to 𝓬𝓸𝓷𝓽𝓻𝓲𝓫𝓾𝓽𝓮
 i vibecoded ts so its stupid but i have some basic knowledges and wont doxx myself by leaking .env
 yeah i guess
+
+and it has a jingle. played after two songs, like a radio...... its stupid
 command lists:
 !help. get help
 - `!load_playlist <URL>`
