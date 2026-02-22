@@ -1,0 +1,1141 @@
+--- bot.py	2026-02-21 21:56:09.327538846 +0700
++++ ezymusicbot/bot.py	2026-02-22 20:30:46.779939680 +0700
+@@ -14,6 +14,16 @@
+ import re
+ import functools
+ import aiohttp
++import socket
++
++# ISP DNS bypass for Danbooru (common in some regions)
++_orig_getaddrinfo = socket.getaddrinfo
++def _custom_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
++    if host == 'danbooru.donmai.us':
++        # Cloudflare IP for Danbooru
++        return _orig_getaddrinfo('104.26.10.39', port, family, type, proto, flags)
++    return _orig_getaddrinfo(host, port, family, type, proto, flags)
++socket.getaddrinfo = _custom_getaddrinfo
+ 
+ load_dotenv()
+ 
+@@ -80,6 +90,9 @@
+                 'last_playlist': [],
+                 # Flag to prevent automatic queue play after interrupt
+                 'interrupt_next': False,
++                'preload_task': None,
++                # Per-guild jingle override (None = use global self.jingle_path)
++                'guild_jingle_path': None,
+             }
+         return self.current_guild_data[guild_id]
+ 
+@@ -295,6 +308,45 @@
+             traceback.print_exc()
+             return None
+     
++    async def preload_next_song(self, guild_id):
++        """Background task to preload the next song's audio URL 10s before current song ends"""
++        guild_data = self.get_guild_data(guild_id)
++        current_song = guild_data.get('current_song')
++        if not current_song:
++            return
++            
++        # duration is in seconds
++        duration = current_song.get('duration', 0)
++        # Sleep until 10 seconds before the song ends
++        sleep_time = max(0, duration - 10)
++        if sleep_time <= 0:
++            return
++            
++        try:
++            await asyncio.sleep(sleep_time)
++            
++            # Wake up, check if we're still playing the same song
++            if guild_data.get('current_song') != current_song or not guild_data.get('playing'):
++                return
++                
++            # Check if there is a next song in the queue
++            if not guild_data['queue']:
++                # No next song to preload
++                return
++                
++            next_song = guild_data['queue'][0]
++            if 'preloaded_url' not in next_song:
++                print(f"[*] Preloading audio URL for next song: {next_song.get('title')}")
++                url = await self.get_audio_url(next_song['url'])
++                if url:
++                    next_song['preloaded_url'] = url
++                    print(f"[+] Successfully preloaded: {next_song.get('title')}")
++        except asyncio.CancelledError:
++            # Task was cancelled (e.g., song was skipped or stopped)
++            pass
++        except Exception as e:
++            print(f"[!] Error in preload_next_song: {e}")
++
+     async def play_audio(self, guild_id, voice_client, audio_url, song_info):
+         """Play audio in voice channel"""
+         try:
+@@ -304,8 +356,19 @@
+             guild_data['playing'] = True
+             guild_data['current_voice_client'] = voice_client
+             
++            # Cancel any existing preload task
++            if guild_data.get('preload_task'):
++                guild_data['preload_task'].cancel()
++                guild_data['preload_task'] = None
++                
+             print(f"[*] Now playing: {song_info['title']} by {song_info['uploader']}")
+             
++            # Start a new preload task if we have a valid duration > 10s
++            duration = song_info.get('duration', 0)
++            if duration > 10:
++                loop = self.bot.loop
++                guild_data['preload_task'] = loop.create_task(self.preload_next_song(guild_id))
++            
+             # Use direct audio source
+             audio_source = discord.FFmpegPCMAudio(audio_url, **ffmpeg_stream_options)
+             
+@@ -335,10 +398,13 @@
+             guild_data['interrupt_next'] = False
+             return
+         
+-        guild_data['jingle_count'] += 1
+-
+-        print(f"[+] Song finished: {song_info.get('title', 'Unknown')}")
+-        print(f"[+] Songs played: {guild_data['jingle_count']}")
++        if not song_info.get('skip_jingle'):
++            guild_data['jingle_count'] += 1
++            print(f"[+] Song finished: {song_info.get('title', 'Unknown')}")
++            print(f"[+] Songs played: {guild_data['jingle_count']}")
++        else:
++            print(f"[+] Song finished (live): {song_info.get('title', 'Unknown')}")
++            print("[*] Skipping jingle counter for live play")
+ 
+         # If repeat single-song is enabled, replay the same song
+         if guild_data.get('repeat_song'):
+@@ -352,7 +418,7 @@
+                 print("[!] Could not get audio for repeated song, continuing")
+ 
+         # Check if we need to play a jingle after every 2 songs
+-        if guild_data['jingle_count'] >= 2:
++        if guild_data['jingle_count'] >= 2 and not song_info.get('skip_jingle'):
+             print("[*] Playing radio jingle...")
+             guild_data['jingle_count'] = 0
+             # Generate a simple jingle instead of requiring a file
+@@ -374,14 +440,19 @@
+             print("[*] Playing radio jingle...")
+             audio_source = None
+             
+-            # Try to use custom jingle if set
+-            if self.jingle_path and os.path.exists(self.jingle_path):
+-                print(f"[*] Using custom jingle: {self.jingle_path}")
+-                try:
+-                    audio_source = discord.FFmpegPCMAudio(self.jingle_path, **ffmpeg_local_options)
+-                except Exception as e:
+-                    print(f"[!] Error loading custom jingle: {e}")
+-                    audio_source = None
++            # Try to use guild-specific jingle first, then global jingle_path
++            guild_data = self.get_guild_data(guild_id)
++            guild_jingle = guild_data.get('guild_jingle_path')
++            jingle_candidates = [p for p in [guild_jingle, self.jingle_path] if p]
++            for candidate in jingle_candidates:
++                if os.path.exists(candidate):
++                    print(f"[*] Using jingle: {candidate}")
++                    try:
++                        audio_source = discord.FFmpegPCMAudio(candidate, **ffmpeg_local_options)
++                        break
++                    except Exception as e:
++                        print(f"[!] Error loading jingle {candidate}: {e}")
++                        audio_source = None
+             
+             # Try Windows built-in tada.wav
+             if not audio_source:
+@@ -479,9 +550,15 @@
+         
+         if guild_data['queue']:
+             song = guild_data['queue'].popleft()
+-            print(f"[*] Getting audio URL for: {song['title']}")
+-            
+-            audio_url = await self.get_audio_url(song['url'])
++
++            # Use preloaded URL if available (fetched 10s before end of previous track)
++            audio_url = song.pop('preloaded_url', None)
++            if audio_url:
++                print(f"[*] Using preloaded audio for: {song['title']}")
++            else:
++                print(f"[*] Getting audio URL for: {song['title']}")
++                audio_url = await self.get_audio_url(song['url'])
++
+             if audio_url:
+                 await self.play_audio(guild_id, voice_client, audio_url, song)
+             else:
+@@ -553,6 +630,84 @@
+ @bot.command(name='play', help='Play the queued songs or a single URL/song. Usage: !play [<URL/song name>]')
+ async def play_queue(ctx, *, url: str = None):
+     """Start playing the queue or play a specific song by URL or search query"""
++    await _play_core(ctx, url=url, skip_jingle=False)
++
++@bot.command(name='live_play', help='Play a playlist in live concert mode (no jingles). Usage: !live_play <playlist URL>')
++async def live_play_queue(ctx, *, url: str):
++    """Load and play a playlist without any jingle interruptions, like a live concert"""
++    print(f"\n[*] User {ctx.author} started live playlist: {url}")
++
++    # Must be in a voice channel
++    if not ctx.author.voice or not ctx.author.voice.channel:
++        embed = discord.Embed(
++            title="❌ Error",
++            description="You must be in a voice channel to play music",
++            color=discord.Color.red()
++        )
++        await ctx.send(embed=embed)
++        return
++
++    voice_channel = ctx.author.voice.channel
++
++    # Connect (re-use existing or make new connection)
++    voice_client = discord.utils.get(bot.voice_clients, guild=ctx.guild)
++    if not voice_client or not voice_client.is_connected():
++        try:
++            voice_client = await asyncio.wait_for(voice_channel.connect(), timeout=10.0)
++        except asyncio.TimeoutError:
++            await ctx.send(embed=discord.Embed(title="❌ Connection Timeout", description="Couldn't connect to voice channel.", color=discord.Color.red()))
++            return
++        except discord.ClientException:
++            voice_client = discord.utils.get(bot.voice_clients, guild=ctx.guild)
++        except Exception as e:
++            await ctx.send(embed=discord.Embed(title="❌ Connection Error", description=str(e), color=discord.Color.red()))
++            return
++
++    parsing_embed = discord.Embed(
++        title="🎸 Loading Live Playlist...",
++        description=f"Parsing: {url}",
++        color=discord.Color.orange()
++    )
++    msg = await ctx.send(embed=parsing_embed)
++
++    songs = await music_player.parse_playlist(url)
++    if not songs:
++        await msg.edit(embed=discord.Embed(
++            title="❌ Error",
++            description="Could not load playlist. Make sure the URL is a valid YouTube/YouTube Music playlist.",
++            color=discord.Color.red()
++        ))
++        return
++
++    # Mark all songs as skip_jingle
++    for song in songs:
++        song['skip_jingle'] = True
++
++    guild_data = music_player.get_guild_data(ctx.guild.id)
++
++    # Stop current playback and clear queue
++    if guild_data.get('preload_task'):
++        guild_data['preload_task'].cancel()
++        guild_data['preload_task'] = None
++    if voice_client.is_playing():
++        voice_client.stop()
++    guild_data['queue'].clear()
++
++    for song in songs:
++        guild_data['queue'].append(song)
++    guild_data['last_playlist'] = list(songs)
++    guild_data['jingle_count'] = 0
++
++    await msg.edit(embed=discord.Embed(
++        title="🎸 Live Concert Mode",
++        description=f"Loaded **{len(songs)}** songs — no jingles, pure music 🎶",
++        color=discord.Color.orange()
++    ).add_field(name="First Track", value=songs[0]['title'], inline=False))
++
++    await music_player.play_next_song(ctx.guild.id, voice_client)
++
++async def _play_core(ctx, url: str = None, skip_jingle: bool = False):
++    """Core playback logic for play and live_play commands"""
+     print(f"\n[*] User {ctx.author} started playback")
+     
+     guild_data = music_player.get_guild_data(ctx.guild.id)
+@@ -683,7 +838,8 @@
+                     'url': song_url,
+                     'title': first_result.get('title', 'Unknown Title'),
+                     'duration': first_result.get('duration', 0),
+-                    'uploader': first_result.get('uploader', 'Unknown Artist')
++                    'uploader': first_result.get('uploader', 'Unknown Artist'),
++                    'skip_jingle': skip_jingle
+                 }
+                 print(f"[+] Found: {song['title']} by {song['uploader']}")
+             except Exception as e:
+@@ -707,6 +863,8 @@
+                 await ctx.send(embed=embed)
+                 return
+             song = songs[0]
++            if skip_jingle:
++                song['skip_jingle'] = True
+         
+         # Now we have the song, add to queue and start playback if idle
+         if song:
+@@ -738,6 +896,11 @@
+         await ctx.send(embed=embed)
+         return
+ 
++    if not url and skip_jingle:
++        for s in guild_data['queue']:
++            if isinstance(s, dict):
++                s['skip_jingle'] = True
++
+     # Start playing queue
+     guild_data['jingle_count'] = 0
+     embed = discord.Embed(
+@@ -951,7 +1114,16 @@
+     for _ in range(min(count - 1, len(guild_data['queue']))):
+         guild_data['queue'].popleft()
+         songs_removed += 1
+-    
++
++    # Cancel preload task so next song gets a fresh preload from its own timing
++    if guild_data.get('preload_task'):
++        guild_data['preload_task'].cancel()
++        guild_data['preload_task'] = None
++
++    # Clear preloaded url from songs shifted out of position
++    if guild_data['queue'] and isinstance(guild_data['queue'][0], dict):
++        guild_data['queue'][0].pop('preloaded_url', None)
++
+     # Stop current song to trigger play_next_song
+     voice_client.stop()
+     
+@@ -1048,6 +1220,9 @@
+     if voice_client and voice_client.is_connected():
+         guild_data['playing'] = False
+         guild_data['queue'].clear()
++        if guild_data.get('preload_task'):
++            guild_data['preload_task'].cancel()
++            guild_data['preload_task'] = None
+         voice_client.stop()
+         await voice_client.disconnect()
+         
+@@ -1218,6 +1393,148 @@
+         await ctx.send(embed=embed)
+ 
+ 
++MIDNIGHT_PODCAST_URL = 'https://youtube.com/playlist?list=PLkJ-t-Cn6PgpZMxUqPcaicMcCdp-B5Sal&si=sjfiIYtKZXR6S0re'
++MIDNIGHT_PODCAST_JINGLE = 'stupid ass jingle.wav'
++
++@bot.command(name='midnight_podcast', help='Load and play the Midnight Podcast playlist with its own jingle')
++async def midnight_podcast(ctx):
++    """Load the Midnight Podcast playlist and play it with the custom midnight jingle"""
++    print(f"\n[*] User {ctx.author} started Midnight Podcast")
++
++    if not ctx.author.voice or not ctx.author.voice.channel:
++        embed = discord.Embed(title="❌ Error", description="You must be in a voice channel", color=discord.Color.red())
++        await ctx.send(embed=embed)
++        return
++
++    voice_channel = ctx.author.voice.channel
++    voice_client = discord.utils.get(bot.voice_clients, guild=ctx.guild)
++    if not voice_client or not voice_client.is_connected():
++        try:
++            voice_client = await asyncio.wait_for(voice_channel.connect(), timeout=10.0)
++        except asyncio.TimeoutError:
++            await ctx.send(embed=discord.Embed(title="❌ Connection Timeout", description="Couldn't connect to voice channel.", color=discord.Color.red()))
++            return
++        except discord.ClientException:
++            voice_client = discord.utils.get(bot.voice_clients, guild=ctx.guild)
++        except Exception as e:
++            await ctx.send(embed=discord.Embed(title="❌ Connection Error", description=str(e), color=discord.Color.red()))
++            return
++
++    msg = await ctx.send(embed=discord.Embed(
++        title="🌙 Loading Midnight Podcast...",
++        description="Parsing playlist, give me a sec...",
++        color=discord.Color.dark_blue()
++    ))
++
++    songs = await music_player.parse_playlist(MIDNIGHT_PODCAST_URL)
++    if not songs:
++        await msg.edit(embed=discord.Embed(title="❌ Error", description="Could not load playlist.", color=discord.Color.red()))
++        return
++
++    guild_data = music_player.get_guild_data(ctx.guild.id)
++
++    # Stop current playback and clear queue
++    if guild_data.get('preload_task'):
++        guild_data['preload_task'].cancel()
++        guild_data['preload_task'] = None
++    if voice_client.is_playing():
++        voice_client.stop()
++    guild_data['queue'].clear()
++
++    # Set the guild-specific jingle to the midnight podcast jingle
++    if os.path.exists(MIDNIGHT_PODCAST_JINGLE):
++        guild_data['guild_jingle_path'] = MIDNIGHT_PODCAST_JINGLE
++        print(f"[*] Set midnight podcast jingle: {MIDNIGHT_PODCAST_JINGLE}")
++    else:
++        print(f"[!] Midnight podcast jingle not found: {MIDNIGHT_PODCAST_JINGLE}")
++        guild_data['guild_jingle_path'] = None
++
++    for song in songs:
++        guild_data['queue'].append(song)
++    guild_data['last_playlist'] = list(songs)
++    guild_data['jingle_count'] = 0
++
++    jingle_status = "🎵 with custom midnight jingle" if guild_data['guild_jingle_path'] else "(jingle file not found)"
++    await msg.edit(embed=discord.Embed(
++        title="🌙 Midnight Podcast",
++        description=f"Loaded **{len(songs)}** tracks — {jingle_status}",
++        color=discord.Color.dark_blue()
++    ).add_field(name="First Track", value=songs[0]['title'], inline=False))
++
++    await music_player.play_next_song(ctx.guild.id, voice_client)
++
++
++THAIRMX_URL = 'https://music.youtube.com/playlist?list=PLx8ySUb3nuR0S8BiYrAatu14F0Ojqjf32&si=Q6FDpHCd9-iclJ3B'
++THAIRMX_JINGLE = 'thairmxjing.wav'
++
++@bot.command(name='thairmx', help='Load and play Thai Remix playlist with its own jingle')
++async def thairmx(ctx):
++    """Load the Thai Remix playlist and play it with the custom thairmx jingle"""
++    print(f"\n[*] User {ctx.author} started Thai Remix")
++
++    if not ctx.author.voice or not ctx.author.voice.channel:
++        embed = discord.Embed(title="❌ Error", description="You must be in a voice channel", color=discord.Color.red())
++        await ctx.send(embed=embed)
++        return
++
++    voice_channel = ctx.author.voice.channel
++    voice_client = discord.utils.get(bot.voice_clients, guild=ctx.guild)
++    if not voice_client or not voice_client.is_connected():
++        try:
++            voice_client = await asyncio.wait_for(voice_channel.connect(), timeout=10.0)
++        except asyncio.TimeoutError:
++            await ctx.send(embed=discord.Embed(title="❌ Connection Timeout", description="Couldn't connect to voice channel.", color=discord.Color.red()))
++            return
++        except discord.ClientException:
++            voice_client = discord.utils.get(bot.voice_clients, guild=ctx.guild)
++        except Exception as e:
++            await ctx.send(embed=discord.Embed(title="❌ Connection Error", description=str(e), color=discord.Color.red()))
++            return
++
++    msg = await ctx.send(embed=discord.Embed(
++        title="🎵 Loading Thai Remix...",
++        description="Parsing playlist, give me a sec...",
++        color=discord.Color.from_rgb(255, 50, 100)
++    ))
++
++    songs = await music_player.parse_playlist(THAIRMX_URL)
++    if not songs:
++        await msg.edit(embed=discord.Embed(title="❌ Error", description="Could not load playlist.", color=discord.Color.red()))
++        return
++
++    guild_data = music_player.get_guild_data(ctx.guild.id)
++
++    # Stop current playback and clear queue
++    if guild_data.get('preload_task'):
++        guild_data['preload_task'].cancel()
++        guild_data['preload_task'] = None
++    if voice_client.is_playing():
++        voice_client.stop()
++    guild_data['queue'].clear()
++
++    # Set guild-specific jingle to thairmx jingle
++    if os.path.exists(THAIRMX_JINGLE):
++        guild_data['guild_jingle_path'] = THAIRMX_JINGLE
++        print(f"[*] Set thairmx jingle: {THAIRMX_JINGLE}")
++    else:
++        print(f"[!] Thairmx jingle not found: {THAIRMX_JINGLE}")
++        guild_data['guild_jingle_path'] = None
++
++    for song in songs:
++        guild_data['queue'].append(song)
++    guild_data['last_playlist'] = list(songs)
++    guild_data['jingle_count'] = 0
++
++    jingle_status = "🎵 with Thai Remix jingle" if guild_data['guild_jingle_path'] else "(jingle file not found)"
++    await msg.edit(embed=discord.Embed(
++        title="🎵 Thai Remix",
++        description=f"Loaded **{len(songs)}** tracks — {jingle_status}",
++        color=discord.Color.from_rgb(255, 50, 100)
++    ).add_field(name="First Track", value=songs[0]['title'], inline=False))
++
++    await music_player.play_next_song(ctx.guild.id, voice_client)
++
++
+ @bot.command(name='help', help='Show full command help')
+ async def show_help(ctx):
+     # Create embed with banner
+@@ -1237,52 +1554,51 @@
+         embed.set_image(url="https://media.discordapp.net/attachments/1234567890/1234567890/banner.png")
+         file = None
+     
+-    # Add commands as fields
+-    embed.add_field(
+-        name="!load_playlist <URL>",
+-        value="Load a YouTube or YouTube Music playlist into the server queue.",
+-        inline=False
+-    )
+-    embed.add_field(
+-        name="!play [<URL or search terms>]",
+-        value="If no argument: starts playback of the queued songs.\nIf given a URL: queues the song and starts playback if idle.\nIf given search terms: searches YouTube (top result) and queues it.",
+-        inline=False
+-    )
+-    embed.add_field(
+-        name="!play_now <URL or search terms>",
+-        value="Immediately stops the current track and plays the requested song (does not clear the queue).",
+-        inline=False
+-    )
+-    embed.add_field(
+-        name="!skip [count]",
+-        value="Stop current song and remove count-1 songs from the front of the queue (default count=1).",
+-        inline=False
+-    )
+-    embed.add_field(
+-        name="!queue",
+-        value="Shows the currently playing track and the next up to 10 songs in the queue.",
+-        inline=False
+-    )
++    # ── Playlist / Station commands ──────────────────────────────────
+     embed.add_field(
+-        name="!repeat",
+-        value="Toggle repeating the currently playing song.",
++        name="🎶 Playlist & Stations",
++        value=(
++            "**!load_playlist <URL>** — Load a YouTube/YT Music playlist into the queue\n"
++            "**!play [URL or search]** — Start queue, queue a URL, or search & queue a song\n"
++            "**!play_now <URL or search>** — Immediately play a song, interrupting current track\n"
++            "**!live_play <playlist URL>** — Load & play a playlist in **live concert mode** (no jingles)\n"
++            "**!midnight_podcast** — Load the 🌙 Midnight Podcast playlist with its own jingle\n"
++            "**!thairmx** — Load the 🎵 Thai Remix playlist with its own jingle"
++        ),
+         inline=False
+     )
++
++    # ── Playback controls ────────────────────────────────────────────
+     embed.add_field(
+-        name="!repeat_playlist",
+-        value="Toggle repeating the last loaded playlist. When enabled and the queue empties, the last playlist is re-queued and playback continues.",
++        name="⏯️ Playback Controls",
++        value=(
++            "**!skip [count]** — Skip current song (or multiple songs)\n"
++            "**!repeat** — Toggle repeat for the current song\n"
++            "**!repeat_playlist** — Toggle repeat for the last loaded playlist\n"
++            "**!stop** — Clear queue, stop playback, and disconnect\n"
++            "**!test_jingle** — Play the configured jingle in your voice channel"
++        ),
+         inline=False
+     )
++
++    # ── Queue info ───────────────────────────────────────────────────
+     embed.add_field(
+-        name="!test_jingle",
+-        value="Connects to your channel and plays the configured jingle (or generated sine if none available).",
++        name="📋 Queue",
++        value="**!queue** — Show current track and next 10 songs in queue",
+         inline=False
+     )
++
++    # ── Image / Fun ──────────────────────────────────────────────────
+     embed.add_field(
+-        name="!stop",
+-        value="Clears the queue, stops playback, and disconnects the bot from voice.",
++        name="🎨 Images",
++        value=(
++            "**!wuwa** — Browse Wuthering Waves character art (SFW/NSFW picker)\n"
++            "**!zani** — Get a random Zani image from Danbooru\n"
++            "**!zanisafe** — Get a random Zani image from Safebooru"
++        ),
+         inline=False
+     )
++
+     
+     embed.set_footer(text="Use !help to see this message again")
+     if file:
+@@ -1291,126 +1607,393 @@
+         await ctx.send(embed=embed)
+ 
+ 
+-async def _fetch_and_send_zani(ctx, mode='random'):
++# ---------------------------------------------------------------------------
++# Wuthering Waves character → booru tag mapping
++# Danbooru format: firstname_(wuthering_waves)
++# ---------------------------------------------------------------------------
++WUWA_CHARACTERS = {
++    "Aalto":        "aalto_(wuthering_waves)",
++    "Aemeath":      "aemeath_(wuthering_waves)",
++    "Baizhi":       "baizhi_(wuthering_waves)",
++    "Brant":        "brant_(wuthering_waves)",
++    "Calcharo":     "calcharo_(wuthering_waves)",
++    "Camellya":     "camellya_(wuthering_waves)",
++    "Carlotta":     "carlotta_(wuthering_waves)",
++    "Changli":      "changli_(wuthering_waves)",
++    "Chixia":       "chixia_(wuthering_waves)",
++    "Ciaccona":     "ciaccona_(wuthering_waves)",
++    "Danjin":       "danjin_(wuthering_waves)",
++    "Encore":       "encore_(wuthering_waves)",
++    "Geshuido":     "geshuido_(wuthering_waves)",
++    "Jianxin":      "jianxin_(wuthering_waves)",
++    "Jiyan":        "jiyan_(wuthering_waves)",
++    "Lumi":         "lumi_(wuthering_waves)",
++    "Luoying":      "luoying_(wuthering_waves)",
++    "Luuk Herssen": "luuk_herssen_(wuthering_waves)",
++    "Mortefi":      "mortefi_(wuthering_waves)",
++    "Phoebe":       "phoebe_(wuthering_waves)",
++    "Phrolova":     "phrolova_(wuthering_waves)",
++    "Roccia":       "roccia_(wuthering_waves)",
++    "Rover (F)":    "rover_(wuthering_waves)",
++    "Rover (M)":    "rover_(wuthering_waves)",
++    "Sanhua":       "sanhua_(wuthering_waves)",
++    "Shorekeeper":  "shorekeeper_(wuthering_waves)",
++    "Taoqi":        "taoqi_(wuthering_waves)",
++    "The Shorekeeper": "shorekeeper_(wuthering_waves)",
++    "Verina":       "verina_(wuthering_waves)",
++    "Xiangli Yao":  "xiangli_yao_(wuthering_waves)",
++    "Yangyang":     "yangyang_(wuthering_waves)",
++    "Yinlin":       "yinlin_(wuthering_waves)",
++    "Youhu":        "youhu_(wuthering_waves)",
++    "Yuanwu":       "yuanwu_(wuthering_waves)",
++    "Zani":         "zani_(wuthering_waves)",
++    "Zhezhi":       "zhezhi_(wuthering_waves)",
++}
++
++async def fetch_booru_image(tag: str, nsfw: bool, danbooru_user: str, danbooru_key: str):
++    """Shared fetch logic for Danbooru (nsfw) or Safebooru (sfw).
++    Returns (image_url, post_url, source_name) or raises on error."""
++    if nsfw:
++        url = "https://danbooru.donmai.us/posts.json"
++        params = {'tags': tag, 'limit': 100, 'login': danbooru_user, 'api_key': danbooru_key}
++        response = requests.get(url, params=params, timeout=10)
++        response.raise_for_status()
++        data = response.json()
++        if not data:
++            return None, None, "Danbooru"
++        post = random.choice(data)
++        img = post.get('file_url', '')
++        if not img.startswith('http'):
++            img = f"https://danbooru.donmai.us{img}"
++        return img, f"https://danbooru.donmai.us/posts/{post.get('id')}", "Danbooru"
++    else:
++        url = "https://safebooru.org/index.php?page=dapi&s=post&q=index&json=1"
++        params = {'tags': tag, 'limit': 100}
++        response = requests.get(url, params=params, timeout=10)
++        response.raise_for_status()
++        data = response.json()
++        if not data:
++            return None, None, "Safebooru"
++        post = random.choice(data)
++        img = post.get('file_url') or f"https://safebooru.org/images/{post.get('directory')}/{post.get('image')}"
++        if not img.startswith('http'):
++            img = f"https:{img}" if img.startswith('//') else f"https://safebooru.org/{img.lstrip('/')}"
++        return img, f"https://safebooru.org/index.php?page=post&s=view&id={post.get('id')}", "Safebooru"
++
++
++class WuwaRatingView(discord.ui.View):
++    """Second step: SFW or NSFW choice after character is selected."""
++    def __init__(self, char_name: str, tag: str, danbooru_user: str, danbooru_key: str):
++        super().__init__(timeout=60)
++        self.char_name = char_name
++        self.tag = tag
++        self.danbooru_user = danbooru_user
++        self.danbooru_key = danbooru_key
++
++    async def _send_image(self, interaction: discord.Interaction, nsfw: bool):
++        await interaction.response.defer(thinking=True)
++        try:
++            loop = asyncio.get_event_loop()
++            img_url, post_url, source = await loop.run_in_executor(
++                None,
++                lambda: _fetch_booru_sync(self.tag, nsfw, self.danbooru_user, self.danbooru_key)
++            )
++        except Exception as e:
++            await interaction.followup.send(embed=discord.Embed(
++                title="❌ Fetch Error", description=str(e), color=discord.Color.red()
++            ), ephemeral=True)
++            return
++
++        if not img_url:
++            await interaction.followup.send(embed=discord.Embed(
++                title="❌ No Results",
++                description=f"No images found for **{self.char_name}** on {source}.",
++                color=discord.Color.orange()
++            ), ephemeral=True)
++            return
++
++        mode_label = "🔞 NSFW" if nsfw else "✅ SFW"
++        embed = discord.Embed(
++            title=f"🎨 {self.char_name} (Wuthering Waves) — {mode_label}",
++            description=f"[View on {source}]({post_url})",
++            color=discord.Color.red() if nsfw else discord.Color.teal()
++        )
++        embed.set_image(url=img_url)
++        embed.set_footer(text=f"Source: {source} | Tag: {self.tag}")
++        await interaction.followup.send(embed=embed)
++        self.stop()
++
++    @discord.ui.button(label="✅ SFW (Safebooru)", style=discord.ButtonStyle.green)
++    async def sfw_button(self, interaction: discord.Interaction, button: discord.ui.Button):
++        await self._send_image(interaction, nsfw=False)
++
++    @discord.ui.button(label="🔞 NSFW (Danbooru)", style=discord.ButtonStyle.red)
++    async def nsfw_button(self, interaction: discord.Interaction, button: discord.ui.Button):
++        await self._send_image(interaction, nsfw=True)
++
++
++def _fetch_booru_sync(tag: str, nsfw: bool, danbooru_user: str, danbooru_key: str):
++    """Synchronous version of booru fetch for executor use."""
++    if nsfw:
++        url = "https://danbooru.donmai.us/posts.json"
++        base_params = {'limit': 50}
++        if danbooru_user and danbooru_key:
++            base_params['login'] = danbooru_user
++            base_params['api_key'] = danbooru_key
++
++        # Fetch explicit + questionable separately and combine
++        combined = []
++        for rating in ('e', 'q'):
++            params = {**base_params, 'tags': f'{tag} rating:{rating}'}
++            try:
++                r = requests.get(url, params=params, timeout=10)
++                r.raise_for_status()
++                combined.extend(r.json())
++            except Exception:
++                pass
++
++        # If neither search returned anything, fall back to unfiltered
++        if not combined:
++            params = {**base_params, 'tags': tag, 'limit': 100}
++            try:
++                r = requests.get(url, params=params, timeout=10)
++                r.raise_for_status()
++                combined = r.json()
++            except Exception:
++                pass
++
++        if not combined:
++            return None, None, "Danbooru"
++        post = random.choice(combined)
++        img = post.get('file_url', '')
++        if not img.startswith('http'):
++            img = f"https://danbooru.donmai.us{img}"
++        return img, f"https://danbooru.donmai.us/posts/{post.get('id')}", "Danbooru"
++    else:
++        url = "https://safebooru.org/index.php?page=dapi&s=post&q=index&json=1"
++        params = {'tags': tag, 'limit': 100}
++        response = requests.get(url, params=params, timeout=10)
++        response.raise_for_status()
++        data = response.json()
++        if not data:
++            return None, None, "Safebooru"
++        post = random.choice(data)
++        img = post.get('file_url') or f"https://safebooru.org/images/{post.get('directory')}/{post.get('image')}"
++        if not img.startswith('http'):
++            img = f"https:{img}" if img.startswith('//') else f"https://safebooru.org/{img.lstrip('/')}"
++        return img, f"https://safebooru.org/index.php?page=post&s=view&id={post.get('id')}", "Safebooru"
++
++
++class WuwaCharacterSelect(discord.ui.Select):
++    """Dropdown to select a Wuthering Waves character."""
++    def __init__(self, characters: list[tuple[str, str]], page: int, total_pages: int,
++                 danbooru_user: str, danbooru_key: str):
++        self.danbooru_user = danbooru_user
++        self.danbooru_key = danbooru_key
++        options = [
++            discord.SelectOption(label=name, value=tag, description=tag)
++            for name, tag in characters
++        ]
++        super().__init__(
++            placeholder=f"Choose a character (Page {page}/{total_pages})…",
++            options=options,
++            min_values=1,
++            max_values=1,
++        )
++
++    async def callback(self, interaction: discord.Interaction):
++        tag = self.values[0]
++        # Find the character name from the tag
++        char_name = next((n for n, t in WUWA_CHARACTERS.items() if t == tag), tag)
++        view = WuwaRatingView(char_name, tag, self.danbooru_user, self.danbooru_key)
++        await interaction.response.edit_message(
++            embed=discord.Embed(
++                title=f"🎮 Wuthering Waves — {char_name}",
++                description="Pick your source:",
++                color=discord.Color.blurple()
++            ),
++            view=view
++        )
++
++
++class WuwaCharacterView(discord.ui.View):
++    """Paginated character selection view."""
++    PAGE_SIZE = 25
++
++    def __init__(self, danbooru_user: str, danbooru_key: str, page: int = 1):
++        super().__init__(timeout=60)
++        self.danbooru_user = danbooru_user
++        self.danbooru_key = danbooru_key
++        self.page = page
++
++        all_chars = sorted(WUWA_CHARACTERS.items())  # list of (name, tag)
++        # Deduplicate by tag to avoid duplicate options
++        seen_tags = set()
++        unique_chars = []
++        for name, tag in all_chars:
++            if tag not in seen_tags:
++                seen_tags.add(tag)
++                unique_chars.append((name, tag))
++
++        self.all_chars = unique_chars
++        total_pages = max(1, (len(unique_chars) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
++        self.total_pages = total_pages
++
++        start = (page - 1) * self.PAGE_SIZE
++        page_chars = unique_chars[start:start + self.PAGE_SIZE]
++
++        self.add_item(WuwaCharacterSelect(page_chars, page, total_pages, danbooru_user, danbooru_key))
++
++        if page > 1:
++            self.add_item(WuwaPrevButton(danbooru_user, danbooru_key, page))
++        if page < total_pages:
++            self.add_item(WuwaNextButton(danbooru_user, danbooru_key, page))
++
++
++class WuwaNextButton(discord.ui.Button):
++    def __init__(self, danbooru_user, danbooru_key, current_page):
++        super().__init__(label="Next ▶", style=discord.ButtonStyle.blurple)
++        self.danbooru_user = danbooru_user
++        self.danbooru_key = danbooru_key
++        self.current_page = current_page
++
++    async def callback(self, interaction: discord.Interaction):
++        new_view = WuwaCharacterView(self.danbooru_user, self.danbooru_key, self.current_page + 1)
++        await interaction.response.edit_message(
++            embed=discord.Embed(title="🎮 Wuthering Waves", description="Pick a character:", color=discord.Color.blurple()),
++            view=new_view
++        )
++
++
++class WuwaPrevButton(discord.ui.Button):
++    def __init__(self, danbooru_user, danbooru_key, current_page):
++        super().__init__(label="◀ Prev", style=discord.ButtonStyle.blurple)
++        self.danbooru_user = danbooru_user
++        self.danbooru_key = danbooru_key
++        self.current_page = current_page
++
++    async def callback(self, interaction: discord.Interaction):
++        new_view = WuwaCharacterView(self.danbooru_user, self.danbooru_key, self.current_page - 1)
++        await interaction.response.edit_message(
++            embed=discord.Embed(title="🎮 Wuthering Waves", description="Pick a character:", color=discord.Color.blurple()),
++            view=new_view
++        )
++
++
++@bot.command(name='wuwa', help='Browse Wuthering Waves character art from Danbooru or Safebooru')
++async def wuwa(ctx):
++    """Interactive character picker for Wuthering Waves art"""
++    view = WuwaCharacterView(DANBOORU_USERNAME, DANBOORU_API_KEY)
++    embed = discord.Embed(
++        title="🎮 Wuthering Waves",
++        description=f"Pick a character to browse art for ({len(set(WUWA_CHARACTERS.values()))} resonators available):",
++        color=discord.Color.blurple()
++    )
++    await ctx.send(embed=embed, view=view)
++
++
++@bot.command(name='zani', help='Get a random Zani (Wuthering Waves) image from Danbooru')
++async def zani(ctx):
++    """Fetch a random image of Zani from Danbooru"""
+     try:
++        print(f"\n[*] !zani command triggered by {ctx.author}")
++        
+         url = "https://danbooru.donmai.us/posts.json"
+         params = {
+             'tags': 'zani_(wuthering_waves)',
+-            'limit': 200,  # Fetch more images for better randomization and filtering
++            'limit': 100,  # Fetch more images for better randomization
+         }
+         
++        print("[*] Attempting to fetch from Danbooru...")
++        headers = {}
+         if DANBOORU_USERNAME and DANBOORU_API_KEY:
++            print(f"[*] Using Danbooru authentication: {DANBOORU_USERNAME}")
++            # Danbooru API uses HTTP Basic Auth or passing login/api_key in query string. 
++            # We can use requests auth parameter or params.
+             params['login'] = DANBOORU_USERNAME
+             params['api_key'] = DANBOORU_API_KEY
+-            print(f"[*] Using Danbooru authentication for !zani ({mode})")
+         else:
+-            print(f"[*] No Danbooru authentication configured for !zani ({mode})")
+-            
+-        print(f"[*] Attempting to fetch from Danbooru URL: {url}")
++            print("[*] No Danbooru authentication configured, using unauthenticated request")
+         
+-        # Run requests in executor to avoid blocking the event loop (helps with music playback)
+-        loop = bot.loop
+-        response = await loop.run_in_executor(
+-            None, 
+-            functools.partial(requests.get, url, params=params, timeout=10)
+-        )
++        print(f"[*] Danbooru URL: {url}")
++        # Note: Do not print params if it contains the API key to avoid leaking it in logs
++        print(f"[*] Danbooru params prepared")
++        
++        response = requests.get(url, params=params, headers=headers, timeout=10)
+         response.raise_for_status()
+         data = response.json()
++        print(f"[+] Successfully fetched {len(data)} images from Danbooru")
++        source = "Danbooru"
++        source_url = "https://danbooru.donmai.us"
+         
+         if not data or len(data) == 0:
++            print("[!] No images found!")
+             embed = discord.Embed(
+-                title="❌ No Results", 
+-                description="Could not find any images with that tag.", 
++                title="❌ No Results",
++                description="Could not find any images with that tag.",
+                 color=discord.Color.red()
+             )
+             await ctx.send(embed=embed)
+             return
+-
+-        # Filter based on mode
+-        # Danbooru ratings: 'g' (general), 's' (sensitive), 'q' (questionable), 'e' (explicit)
+-        valid_posts = []
+-        is_nsfw = False
+-        
+-        if mode == 'sfw':
+-            valid_posts = [p for p in data if p.get('rating') in ['g', 's'] and (p.get('file_url') or p.get('large_file_url') or p.get('preview_file_url'))]
+-        elif mode == 'nsfw':
+-            valid_posts = [p for p in data if p.get('rating') in ['q', 'e'] and (p.get('file_url') or p.get('large_file_url') or p.get('preview_file_url'))]
+-            is_nsfw = True
+-        else: # 'random' (50/50 chance)
+-            if random.random() < 0.5:
+-                # Try NSFW first
+-                valid_posts = [p for p in data if p.get('rating') in ['q', 'e'] and (p.get('file_url') or p.get('large_file_url') or p.get('preview_file_url'))]
+-                is_nsfw = True
+-                if not valid_posts: # Fallback to SFW if no NSFW found
+-                    valid_posts = [p for p in data if p.get('rating') in ['g', 's'] and (p.get('file_url') or p.get('large_file_url') or p.get('preview_file_url'))]
+-                    is_nsfw = False
+-            else:
+-                # Try SFW first
+-                valid_posts = [p for p in data if p.get('rating') in ['g', 's'] and (p.get('file_url') or p.get('large_file_url') or p.get('preview_file_url'))]
+-                if not valid_posts: # Fallback to NSFW if no SFW found
+-                    valid_posts = [p for p in data if p.get('rating') in ['q', 'e'] and (p.get('file_url') or p.get('large_file_url') or p.get('preview_file_url'))]
+-                    is_nsfw = True
+-
+-        if not valid_posts:
++        
++        # Pick a random post from the results
++        post = random.choice(data)
++        image_url = post.get('file_url')
++        post_id = post.get('id')
++        print(f"[+] Selected random image: ID {post_id}")
++        
++        if not image_url:
++            print(f"[!] No file_url in post {post_id}")
+             embed = discord.Embed(
+-                title="❌ No Results", 
+-                description=f"Could not find any images for the requested mode.", 
++                title="❌ Error",
++                description="Could not extract image URL from post.",
+                 color=discord.Color.red()
+             )
+             await ctx.send(embed=embed)
+             return
+-            
+-        # Pick a random post from the valid results
+-        post = random.choice(valid_posts)
+-        image_url = post.get('file_url') or post.get('large_file_url') or post.get('preview_file_url')
+-        post_id = post.get('id')
+-        print(f"[+] Selected random image: ID {post_id} (NSFW: {is_nsfw})")
+-        
+-        source = "Danbooru"
+-        source_url = "https://danbooru.donmai.us"
+         
+         # Ensure image_url is absolute
+-        if image_url and not image_url.startswith('http'):
++        if not image_url.startswith('http'):
+             image_url = f"https://{source_url.lstrip('https://')}/{image_url}"
+         
++        print(f"[+] Image URL: {image_url}")
++        
+         # Create embed with image
+-        title_prefix = "🔞 " if is_nsfw else "🎨 "
+         embed = discord.Embed(
+-            title=f"{title_prefix}Zani (Wuthering Waves)",
++            title="🎨 Zani (Wuthering Waves)",
+             description=f"[View on {source}]({source_url}/posts/{post_id})",
+-            color=discord.Color.dark_red() if is_nsfw else discord.Color.purple()
++            color=discord.Color.purple()
+         )
+-        if image_url:
+-            embed.set_image(url=image_url)
++        embed.set_image(url=image_url)
+         
+         # Add metadata if available
+-        tags = post.get('tag_string_character') or post.get('tag_string_copyright') or post.get('tag_string')
+-        if tags:
+-            if len(tags) > 100:
+-                tags = tags[:97] + "..."
+-            embed.add_field(name="Tags", value=tags, inline=False)
++        if post.get('tag_string'):
++            # Danbooru uses 'tag_string' instead of 'tags'
++            embed.add_field(name="Tags", value=post.get('tag_string')[:100] + "...", inline=False)
++        elif post.get('tags'):
++            embed.add_field(name="Tags", value=post.get('tags')[:100] + "...", inline=False)
+             
+         if post.get('score'):
+             embed.add_field(name="Score", value=str(post.get('score')), inline=True)
+-            
+-        embed.set_footer(text=f"Source: {source} | Rating: {post.get('rating', 'Unknown').upper()}")
++        
++        embed.set_footer(text=f"Source: {source}")
+         
+         print(f"[+] Sending embed to Discord")
+         await ctx.send(embed=embed)
+         
+     except requests.exceptions.Timeout:
+-        print(f"[!] Final request timed out")
++        print(f"[!] Danbooru request timed out")
+         embed = discord.Embed(
+             title="❌ Timeout",
+-            description="Request timed out. Try again later.",
++            description="Danbooru request timed out. Try again later.",
+             color=discord.Color.red()
+         )
+         await ctx.send(embed=embed)
+     except requests.exceptions.RequestException as e:
+-        print(f"[!] Final network error: {type(e).__name__}: {e}")
++        print(f"[!] Danbooru network error: {type(e).__name__}: {e}")
+         embed = discord.Embed(
+             title="❌ Network Error",
+-            description=f"Cannot reach image source. You may need to change DNS or use a VPN.",
++            description=f"Cannot reach Danbooru. ({type(e).__name__})",
+             color=discord.Color.red()
+         )
+         await ctx.send(embed=embed)
+@@ -1425,23 +2008,112 @@
+         )
+         await ctx.send(embed=embed)
+ 
+-@bot.command(name='zani', help='Get a random Zani image (50% chance SFW, 50% chance NSFW)')
+-async def zani(ctx):
+-    """Fetch a random Zani image (50/50 SFW/NSFW)"""
+-    print(f"\n[*] !zani command triggered by {ctx.author}")
+-    await _fetch_and_send_zani(ctx, mode='random')
+-
+-@bot.command(name='zanisfw', help='Get a random SFW Zani image')
+-async def zanisfw(ctx):
+-    """Fetch a random SFW Zani image"""
+-    print(f"\n[*] !zanisfw command triggered by {ctx.author}")
+-    await _fetch_and_send_zani(ctx, mode='sfw')
+-
+-@bot.command(name='zaninsfw', help='Get a random NSFW Zani image')
+-async def zaninsfw(ctx):
+-    """Fetch a random NSFW Zani image"""
+-    print(f"\n[*] !zaninsfw command triggered by {ctx.author}")
+-    await _fetch_and_send_zani(ctx, mode='nsfw')
++@bot.command(name='zanisafe', help='Get a random Zani (Wuthering Waves) image from Safebooru')
++async def zanisafe(ctx):
++    """Fetch a random image of Zani from Safebooru"""
++    try:
++        print(f"\n[*] !zanisafe command triggered by {ctx.author}")
++        
++        url = "https://safebooru.org/index.php?page=dapi&s=post&q=index&json=1"
++        params = {
++            'tags': 'zani_(wuthering_waves)',
++            'limit': 100,  # Fetch more images for better randomization
++        }
++        
++        print(f"[*] Attempting to fetch from Safebooru...")
++        print(f"[*] Safebooru URL: {url}")
++        
++        response = requests.get(url, params=params, timeout=10)
++        response.raise_for_status()
++        data = response.json()
++        print(f"[+] Successfully fetched {len(data)} images from Safebooru")
++        source = "Safebooru"
++        source_url = "https://safebooru.org"
++        
++        if not data or len(data) == 0:
++            print("[!] No images found!")
++            embed = discord.Embed(
++                title="❌ No Results",
++                description="Could not find any images with that tag.",
++                color=discord.Color.red()
++            )
++            await ctx.send(embed=embed)
++            return
++        
++        # Pick a random post from the results
++        post = random.choice(data)
++        
++        # Safebooru image format: //safebooru.org/images/directory/image.ext
++        # Or file_url string mapping directly
++        image_url = post.get('file_url')
++        if not image_url and post.get('directory') and post.get('image'):
++            image_url = f"https://safebooru.org/images/{post.get('directory')}/{post.get('image')}"
++
++        post_id = post.get('id')
++        print(f"[+] Selected random image: ID {post_id}")
++        
++        if not image_url:
++            print(f"[!] No valid image url in post {post_id}")
++            embed = discord.Embed(
++                title="❌ Error",
++                description="Could not extract image URL from post.",
++                color=discord.Color.red()
++            )
++            await ctx.send(embed=embed)
++            return
++        
++        # Ensure image_url is fully qualified URL
++        if not image_url.startswith('http'):
++            image_url = f"https:{image_url}" if image_url.startswith('//') else f"https://safebooru.org/{image_url.lstrip('/')}"
++        
++        print(f"[+] Image URL: {image_url}")
++        
++        # Create embed with image
++        embed = discord.Embed(
++            title="🎨 Zani (Wuthering Waves)",
++            description=f"[View on {source}]({source_url}/index.php?page=post&s=view&id={post_id})",
++            color=discord.Color.blue()
++        )
++        embed.set_image(url=image_url)
++        
++        # Add metadata if available
++        if post.get('tags'):
++            embed.add_field(name="Tags", value=post.get('tags')[:100] + "...", inline=False)
++            
++        if post.get('score'):
++            embed.add_field(name="Score", value=str(post.get('score')), inline=True)
++        
++        embed.set_footer(text=f"Source: {source}")
++        
++        print(f"[+] Sending embed to Discord")
++        await ctx.send(embed=embed)
++        
++    except requests.exceptions.Timeout:
++        print(f"[!] Safebooru request timed out")
++        embed = discord.Embed(
++            title="❌ Timeout",
++            description="Safebooru request timed out. Try again later.",
++            color=discord.Color.red()
++        )
++        await ctx.send(embed=embed)
++    except requests.exceptions.RequestException as e:
++        print(f"[!] Safebooru network error: {type(e).__name__}: {e}")
++        embed = discord.Embed(
++            title="❌ Network Error",
++            description=f"Cannot reach Safebooru. ({type(e).__name__})",
++            color=discord.Color.red()
++        )
++        await ctx.send(embed=embed)
++    except Exception as e:
++        print(f"[!] Error in !zanisafe command: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        embed = discord.Embed(
++            title="❌ Error",
++            description=f"An error occurred: {str(e)}",
++            color=discord.Color.red()
++        )
++        await ctx.send(embed=embed)
+ 
+ @bot.command(name='sourcecode', help='Send the bot.py source code file')
+ async def sourcecode(ctx):
