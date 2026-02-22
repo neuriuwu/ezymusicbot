@@ -5,7 +5,7 @@
 BOT_PREFIX = '!'
 
 # Discord Bot Token (can also use DISCORD_BOT_TOKEN environment variable)
-DISCORD_BOT_TOKEN = 'MTQ2OTg5MjM5NzUyODc3NjkxMg.GSx8Aj.et76sZja97AEcWYV98f-ZrfonVbWC_v-wNt6PM'
+DISCORD_BOT_TOKEN = 'tokenhere'
 
 # YT-DLP Audio Format
 # Options: 'bestaudio/best', 'worst', '18' (360p video), etc.
