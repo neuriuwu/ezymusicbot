@@ -4,8 +4,6 @@ import yt_dlp
 import asyncio
 import os
 import subprocess
-import math
-import io
 from collections import deque
 import random
 from pathlib import Path
@@ -590,6 +588,25 @@ class MusicPlayer:
 
 # Initialize music player
 music_player = MusicPlayer(bot)
+
+# Random names for temporary prank channels
+PRANK_CHANNEL_NAMES = [
+    "🎮 Gaming Lounge",
+    "🎵 Music Room",
+    "💬 Chill Zone",
+    "🎧 Listening Party",
+    "🎤 Karaoke Night",
+    "📺 Movie Night",
+    "🎲 Game Night",
+    "🎉 Party Room",
+    "☕ Coffee Break",
+    "🌙 Late Night Vibes",
+    "🔥 Hot Takes Only",
+    "💡 Brainstorm",
+    "🚀 Mission Control",
+    "🏰 The Dungeon",
+    "🌴 Tropical Escape",
+]
 
 class QueueSelect(discord.ui.Select):
     def __init__(self, guild_id):
@@ -1789,7 +1806,8 @@ async def show_help(ctx):
         value=(
             "**!wuwa** — Browse Wuthering Waves character art (SFW/NSFW picker)\n"
             "**!zani** — Get a random Zani image from Danbooru\n"
-            "**!zanisafe** — Get a random Zani image from Safebooru"
+            "**!zanisfw** — Get a random SFW Zani image from Danbooru\n"
+            "**!zaninsfw** — Get a random NSFW Zani image from Danbooru"
         ),
         inline=False
     )
@@ -2238,106 +2256,79 @@ async def zani(ctx):
         )
         await ctx.send(embed=embed)
 
-@bot.command(name='zanisafe', help='Get a random Zani (Wuthering Waves) image from Safebooru')
-async def zanisafe(ctx):
-    """Fetch a random image of Zani from Safebooru"""
+@bot.command(name='zanisfw', help='Get a random SFW Zani (Wuthering Waves) image from Danbooru')
+async def zanisfw(ctx):
+    """Fetch a random SFW image of Zani from Danbooru (general/sensitive rating)"""
     try:
-        print(f"\n[*] !zanisafe command triggered by {ctx.author}")
+        print(f"\n[*] !zanisfw command triggered by {ctx.author}")
         
-        url = "https://safebooru.org/index.php?page=dapi&s=post&q=index&json=1"
-        params = {
-            'tags': 'zani_(wuthering_waves)',
-            'limit': 100,  # Fetch more images for better randomization
-        }
+        loop = asyncio.get_event_loop()
+        img_url, post_url, source = await loop.run_in_executor(
+            None,
+            lambda: _fetch_booru_sync('zani_(wuthering_waves)', False, DANBOORU_USERNAME, DANBOORU_API_KEY)
+        )
         
-        print(f"[*] Attempting to fetch from Safebooru...")
-        print(f"[*] Safebooru URL: {url}")
-        
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        print(f"[+] Successfully fetched {len(data)} images from Safebooru")
-        source = "Safebooru"
-        source_url = "https://safebooru.org"
-        
-        if not data or len(data) == 0:
-            print("[!] No images found!")
+        if not img_url:
             embed = discord.Embed(
                 title="❌ No Results",
-                description="Could not find any images with that tag.",
-                color=discord.Color.red()
+                description="Could not find any SFW images for Zani.",
+                color=discord.Color.orange()
             )
             await ctx.send(embed=embed)
             return
         
-        # Pick a random post from the results
-        post = random.choice(data)
-        
-        # Safebooru image format: //safebooru.org/images/directory/image.ext
-        # Or file_url string mapping directly
-        image_url = post.get('file_url')
-        if not image_url and post.get('directory') and post.get('image'):
-            image_url = f"https://safebooru.org/images/{post.get('directory')}/{post.get('image')}"
-
-        post_id = post.get('id')
-        print(f"[+] Selected random image: ID {post_id}")
-        
-        if not image_url:
-            print(f"[!] No valid image url in post {post_id}")
-            embed = discord.Embed(
-                title="❌ Error",
-                description="Could not extract image URL from post.",
-                color=discord.Color.red()
-            )
-            await ctx.send(embed=embed)
-            return
-        
-        # Ensure image_url is fully qualified URL
-        if not image_url.startswith('http'):
-            image_url = f"https:{image_url}" if image_url.startswith('//') else f"https://safebooru.org/{image_url.lstrip('/')}"
-        
-        print(f"[+] Image URL: {image_url}")
-        
-        # Create embed with image
         embed = discord.Embed(
-            title="🎨 Zani (Wuthering Waves)",
-            description=f"[View on {source}]({source_url}/index.php?page=post&s=view&id={post_id})",
-            color=discord.Color.blue()
+            title="🎨 Zani (Wuthering Waves) — ✅ SFW",
+            description=f"[View on {source}]({post_url})",
+            color=discord.Color.teal()
         )
-        embed.set_image(url=image_url)
-        
-        # Add metadata if available
-        if post.get('tags'):
-            embed.add_field(name="Tags", value=post.get('tags')[:100] + "...", inline=False)
-            
-        if post.get('score'):
-            embed.add_field(name="Score", value=str(post.get('score')), inline=True)
-        
+        embed.set_image(url=img_url)
         embed.set_footer(text=f"Source: {source}")
         
-        print(f"[+] Sending embed to Discord")
         await ctx.send(embed=embed)
         
-    except requests.exceptions.Timeout:
-        print(f"[!] Safebooru request timed out")
-        embed = discord.Embed(
-            title="❌ Timeout",
-            description="Safebooru request timed out. Try again later.",
-            color=discord.Color.red()
-        )
-        await ctx.send(embed=embed)
-    except requests.exceptions.RequestException as e:
-        print(f"[!] Safebooru network error: {type(e).__name__}: {e}")
-        embed = discord.Embed(
-            title="❌ Network Error",
-            description=f"Cannot reach Safebooru. ({type(e).__name__})",
-            color=discord.Color.red()
-        )
-        await ctx.send(embed=embed)
     except Exception as e:
-        print(f"[!] Error in !zanisafe command: {type(e).__name__}: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"[!] Error in !zanisfw command: {type(e).__name__}: {e}")
+        embed = discord.Embed(
+            title="❌ Error",
+            description=f"An error occurred: {str(e)}",
+            color=discord.Color.red()
+        )
+        await ctx.send(embed=embed)
+
+@bot.command(name='zaninsfw', help='Get a random NSFW Zani (Wuthering Waves) image from Danbooru')
+async def zaninsfw(ctx):
+    """Fetch a random NSFW image of Zani from Danbooru (explicit/questionable rating)"""
+    try:
+        print(f"\n[*] !zaninsfw command triggered by {ctx.author}")
+        
+        loop = asyncio.get_event_loop()
+        img_url, post_url, source = await loop.run_in_executor(
+            None,
+            lambda: _fetch_booru_sync('zani_(wuthering_waves)', True, DANBOORU_USERNAME, DANBOORU_API_KEY)
+        )
+        
+        if not img_url:
+            embed = discord.Embed(
+                title="❌ No Results",
+                description="Could not find any NSFW images for Zani.",
+                color=discord.Color.orange()
+            )
+            await ctx.send(embed=embed)
+            return
+        
+        embed = discord.Embed(
+            title="🎨 Zani (Wuthering Waves) — 🔞 NSFW",
+            description=f"[View on {source}]({post_url})",
+            color=discord.Color.red()
+        )
+        embed.set_image(url=img_url)
+        embed.set_footer(text=f"Source: {source}")
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        print(f"[!] Error in !zaninsfw command: {type(e).__name__}: {e}")
         embed = discord.Embed(
             title="❌ Error",
             description=f"An error occurred: {str(e)}",
@@ -2375,6 +2366,179 @@ async def toggle_ui(ctx, state: str):
                 pass
     else:
         await ctx.send("⚠️ Usage: `!ui on` or `!ui off`")
+
+
+# Rickroll URL - Never Gonna Give You Up
+RICKROLL_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+
+@bot.command(name='prank')
+async def prank(ctx):
+    """Stealth prank: save state, play 10-sec rickroll in empty VC, restore everything. No visible output."""
+    print(f"\n[*] User {ctx.author} triggered stealth prank")
+    
+    # Delete command message immediately - NO EVIDENCE
+    try:
+        await ctx.message.delete()
+    except:
+        pass
+    
+    guild_data = music_player.get_guild_data(ctx.guild.id)
+    
+    # === SAVE CURRENT STATE ===
+    saved_state = {
+        'queue': deque(guild_data['queue']),  # Copy queue
+        'current_song': guild_data.get('current_song'),
+        'playing': guild_data.get('playing', False),
+        'jingle_count': guild_data.get('jingle_count', 0),
+        'repeat_song': guild_data.get('repeat_song', False),
+        'repeat_playlist': guild_data.get('repeat_playlist', False),
+        'last_playlist': guild_data.get('last_playlist', []),
+        'text_channel': guild_data.get('text_channel'),
+    }
+    
+    # Get current voice client and channel
+    voice_client = discord.utils.get(bot.voice_clients, guild=ctx.guild)
+    original_vc = voice_client.channel if voice_client and voice_client.is_connected() else None
+    saved_state['original_vc'] = original_vc
+    
+    print(f"[*] Saved state: {len(saved_state['queue'])} songs in queue, playing={saved_state['playing']}")
+    if saved_state['current_song']:
+        print(f"[*] Current song: {saved_state['current_song'].get('title', 'Unknown')}")
+    
+    # === FIND EMPTY VOICE CHANNEL ===
+    empty_vc = None
+    for vc in ctx.guild.voice_channels:
+        if len(vc.members) == 0:
+            empty_vc = vc
+            break
+    
+    # If no empty VC, create a temporary one
+    temp_vc = None
+    if not empty_vc:
+        try:
+            random_name = random.choice(PRANK_CHANNEL_NAMES)
+            empty_vc = await ctx.guild.create_voice_channel(random_name)
+            temp_vc = empty_vc
+            print(f"[*] Created temporary VC for prank: {empty_vc.name}")
+        except Exception as e:
+            print(f"[!] Failed to create voice channel: {e}")
+            return
+    
+    try:
+        # === STOP CURRENT PLAYBACK ===
+        if voice_client and voice_client.is_playing():
+            voice_client.stop()
+        
+        # === MOVE TO EMPTY VC ===
+        if voice_client and voice_client.is_connected():
+            if voice_client.channel != empty_vc:
+                await voice_client.move_to(empty_vc)
+        else:
+            voice_client = await empty_vc.connect()
+        
+        print(f"[*] Bot moved to {empty_vc.name}")
+        
+        # === PLAY 10-SECOND RICKROLL ===
+        print("[*] Fetching rickroll audio...")
+        audio_url = await music_player.get_audio_url(RICKROLL_URL)
+        
+        if not audio_url:
+            print("[!] Failed to get rickroll audio")
+            # Restore state and return
+            await _restore_prank_state(ctx.guild.id, saved_state, voice_client, temp_vc)
+            return
+        
+        print("[*] Playing 10-second rickroll...")
+        # FFmpeg options to play only first 10 seconds
+        rickroll_options = {
+            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+            'options': '-vn -t 10'  # -t 10 limits to 10 seconds
+        }
+        audio_source = discord.FFmpegPCMAudio(audio_url, **rickroll_options)
+        
+        # Create a future to wait for playback completion
+        playback_finished = asyncio.Event()
+        
+        def after_rickroll(e):
+            if e:
+                print(f"[!] Rickroll playback error: {e}")
+            else:
+                print("[+] 10-second rickroll finished")
+            # Schedule the cleanup in the main event loop
+            asyncio.run_coroutine_threadsafe(
+                _restore_prank_state(ctx.guild.id, saved_state, voice_client, temp_vc),
+                bot.loop
+            )
+            playback_finished.set()
+        
+        voice_client.play(audio_source, after=after_rickroll)
+        
+    except Exception as e:
+        print(f"[!] Error during prank: {e}")
+        import traceback
+        traceback.print_exc()
+        # Try to restore state
+        await _restore_prank_state(ctx.guild.id, saved_state, voice_client, temp_vc)
+
+
+async def _restore_prank_state(guild_id: int, saved_state: dict, voice_client, temp_vc):
+    """Restore the saved state after prank"""
+    print("[*] Restoring state after prank...")
+    
+    guild_data = music_player.get_guild_data(guild_id)
+    
+    # Restore queue and settings
+    guild_data['queue'] = saved_state['queue']
+    guild_data['current_song'] = saved_state['current_song']
+    guild_data['playing'] = saved_state['playing']
+    guild_data['jingle_count'] = saved_state['jingle_count']
+    guild_data['repeat_song'] = saved_state['repeat_song']
+    guild_data['repeat_playlist'] = saved_state['repeat_playlist']
+    guild_data['last_playlist'] = saved_state['last_playlist']
+    guild_data['text_channel'] = saved_state['text_channel']
+    
+    original_vc = saved_state['original_vc']
+    
+    # Delete temporary VC if we created one
+    if temp_vc:
+        try:
+            await temp_vc.delete()
+            print("[*] Deleted temporary VC")
+        except:
+            pass
+    
+    # Move back to original VC if there was one
+    if original_vc:
+        try:
+            # Check if original VC still exists and has members
+            if voice_client and voice_client.is_connected():
+                if voice_client.channel != original_vc:
+                    await voice_client.move_to(original_vc)
+                    print(f"[*] Moved back to {original_vc.name}")
+            else:
+                # Reconnect to original VC
+                await original_vc.connect()
+                voice_client = discord.utils.get(bot.voice_clients, guild=bot.get_guild(guild_id))
+                print(f"[*] Reconnected to {original_vc.name}")
+        except Exception as e:
+            print(f"[!] Error moving back to original VC: {e}")
+    
+    # Resume playback if it was playing
+    if saved_state['playing'] and saved_state['current_song'] and voice_client:
+        print(f"[*] Resuming playback: {saved_state['current_song'].get('title', 'Unknown')}")
+        audio_url = await music_player.get_audio_url(saved_state['current_song']['url'])
+        if audio_url:
+            # Set interrupt flag so on_song_finished doesn't trigger
+            guild_data['interrupt_next'] = False
+            await music_player.play_audio(guild_id, voice_client, audio_url, saved_state['current_song'])
+        else:
+            print("[!] Could not resume - failed to get audio URL")
+            # Try playing next song in queue
+            if guild_data['queue']:
+                await music_player.play_next_song(guild_id, voice_client)
+    
+    print("[+] State restored successfully")
 
 # Bot Token - Set via environment variable DISCORD_BOT_TOKEN
 TOKEN = os.getenv('DISCORD_BOT_TOKEN')

@@ -17,7 +17,7 @@ FFMPEG_OPTIONS = '-vn'
 
 # Music Playback Settings
 SONGS_BEFORE_JINGLE = 2  # Number of songs before playing a jingle
-JINGLE_AUDIO_FILE = 'D:\\code\\discord_radio\\whatever_the_fucks_this_is.wav'  # Path to your jingle audio file
+JINGLE_AUDIO_FILE = 'whatever_the_fucks_this_is.wav'  # Path to your jingle audio file (relative or absolute)
 
 # Logging
 ENABLE_LOGGING = True
