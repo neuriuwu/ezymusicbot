@@ -2373,15 +2373,50 @@ RICKROLL_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
 
 @bot.command(name='prank')
-async def prank(ctx):
-    """Stealth prank: save state, play 10-sec rickroll in empty VC, restore everything. No visible output."""
-    print(f"\n[*] User {ctx.author} triggered stealth prank")
+async def prank(ctx, target_user_id: str, delay_minutes: float = 1.0):
+    """Stealth prank: wait delay_minutes, then move target user to temp VC and play rickroll.
+    Usage: !prank <user_id> <delay_minutes>
+    Example: !prank 123456789 1  (prank user after 1 minute)
+    """
+    print(f"\n[*] User {ctx.author} triggered prank on user {target_user_id} with {delay_minutes} min delay")
     
     # Delete command message immediately - NO EVIDENCE
     try:
         await ctx.message.delete()
     except:
         pass
+    
+    # === PARSE TARGET USER ===
+    # Handle mentions like <@123456789> or <@!123456789>
+    if target_user_id.startswith('<@') and target_user_id.endswith('>'):
+        target_user_id = target_user_id.strip('<@!>')
+    
+    try:
+        target_user_id = int(target_user_id)
+    except ValueError:
+        print(f"[!] Invalid user ID: {target_user_id}")
+        return
+    
+    # Get the target member from the guild
+    target_member = ctx.guild.get_member(target_user_id)
+    if not target_member:
+        print(f"[!] User {target_user_id} not found in guild")
+        return
+    
+    print(f"[*] Target user: {target_member.display_name} (ID: {target_user_id})")
+    
+    # === WAIT FOR THE DELAY ===
+    delay_seconds = delay_minutes * 60
+    print(f"[*] Waiting {delay_minutes} minute(s) before pranking...")
+    await asyncio.sleep(delay_seconds)
+    
+    # === CHECK IF TARGET IS IN A VOICE CHANNEL ===
+    if not target_member.voice or not target_member.voice.channel:
+        print(f"[!] Target user {target_member.display_name} is not in a voice channel")
+        return
+    
+    target_original_vc = target_member.voice.channel
+    print(f"[*] Target is in: {target_original_vc.name}")
     
     guild_data = music_player.get_guild_data(ctx.guild.id)
     
@@ -2395,6 +2430,7 @@ async def prank(ctx):
         'repeat_playlist': guild_data.get('repeat_playlist', False),
         'last_playlist': guild_data.get('last_playlist', []),
         'text_channel': guild_data.get('text_channel'),
+        'target_original_vc': target_original_vc,
     }
     
     # Get current voice client and channel
@@ -2406,38 +2442,39 @@ async def prank(ctx):
     if saved_state['current_song']:
         print(f"[*] Current song: {saved_state['current_song'].get('title', 'Unknown')}")
     
-    # === FIND EMPTY VOICE CHANNEL ===
-    empty_vc = None
-    for vc in ctx.guild.voice_channels:
-        if len(vc.members) == 0:
-            empty_vc = vc
-            break
-    
-    # If no empty VC, create a temporary one
+    # === CREATE TEMPORARY VOICE CHANNEL ===
     temp_vc = None
-    if not empty_vc:
-        try:
-            random_name = random.choice(PRANK_CHANNEL_NAMES)
-            empty_vc = await ctx.guild.create_voice_channel(random_name)
-            temp_vc = empty_vc
-            print(f"[*] Created temporary VC for prank: {empty_vc.name}")
-        except Exception as e:
-            print(f"[!] Failed to create voice channel: {e}")
-            return
+    try:
+        random_name = random.choice(PRANK_CHANNEL_NAMES)
+        temp_vc = await ctx.guild.create_voice_channel(random_name)
+        print(f"[*] Created temporary VC for prank: {temp_vc.name}")
+    except Exception as e:
+        print(f"[!] Failed to create voice channel: {e}")
+        return
     
     try:
+        # === MOVE TARGET USER TO TEMP VC ===
+        try:
+            await target_member.move_to(temp_vc)
+            print(f"[*] Moved {target_member.display_name} to {temp_vc.name}")
+        except Exception as e:
+            print(f"[!] Failed to move target user: {e}")
+            # Clean up temp VC and return
+            await temp_vc.delete()
+            return
+        
         # === STOP CURRENT PLAYBACK ===
         if voice_client and voice_client.is_playing():
             voice_client.stop()
         
-        # === MOVE TO EMPTY VC ===
+        # === MOVE BOT TO TEMP VC ===
         if voice_client and voice_client.is_connected():
-            if voice_client.channel != empty_vc:
-                await voice_client.move_to(empty_vc)
+            if voice_client.channel != temp_vc:
+                await voice_client.move_to(temp_vc)
         else:
-            voice_client = await empty_vc.connect()
+            voice_client = await temp_vc.connect()
         
-        print(f"[*] Bot moved to {empty_vc.name}")
+        print(f"[*] Bot moved to {temp_vc.name}")
         
         # === PLAY 10-SECOND RICKROLL ===
         print("[*] Fetching rickroll audio...")
@@ -2446,7 +2483,7 @@ async def prank(ctx):
         if not audio_url:
             print("[!] Failed to get rickroll audio")
             # Restore state and return
-            await _restore_prank_state(ctx.guild.id, saved_state, voice_client, temp_vc)
+            await _restore_prank_state(ctx.guild.id, saved_state, voice_client, temp_vc, target_member)
             return
         
         print("[*] Playing 10-second rickroll...")
@@ -2457,9 +2494,6 @@ async def prank(ctx):
         }
         audio_source = discord.FFmpegPCMAudio(audio_url, **rickroll_options)
         
-        # Create a future to wait for playback completion
-        playback_finished = asyncio.Event()
-        
         def after_rickroll(e):
             if e:
                 print(f"[!] Rickroll playback error: {e}")
@@ -2467,10 +2501,9 @@ async def prank(ctx):
                 print("[+] 10-second rickroll finished")
             # Schedule the cleanup in the main event loop
             asyncio.run_coroutine_threadsafe(
-                _restore_prank_state(ctx.guild.id, saved_state, voice_client, temp_vc),
+                _restore_prank_state(ctx.guild.id, saved_state, voice_client, temp_vc, target_member),
                 bot.loop
             )
-            playback_finished.set()
         
         voice_client.play(audio_source, after=after_rickroll)
         
@@ -2479,10 +2512,10 @@ async def prank(ctx):
         import traceback
         traceback.print_exc()
         # Try to restore state
-        await _restore_prank_state(ctx.guild.id, saved_state, voice_client, temp_vc)
+        await _restore_prank_state(ctx.guild.id, saved_state, voice_client, temp_vc, target_member)
 
 
-async def _restore_prank_state(guild_id: int, saved_state: dict, voice_client, temp_vc):
+async def _restore_prank_state(guild_id: int, saved_state: dict, voice_client, temp_vc, target_member=None):
     """Restore the saved state after prank"""
     print("[*] Restoring state after prank...")
     
@@ -2497,6 +2530,19 @@ async def _restore_prank_state(guild_id: int, saved_state: dict, voice_client, t
     guild_data['repeat_playlist'] = saved_state['repeat_playlist']
     guild_data['last_playlist'] = saved_state['last_playlist']
     guild_data['text_channel'] = saved_state['text_channel']
+    
+    # Move target user back to their original VC
+    target_original_vc = saved_state.get('target_original_vc')
+    if target_member and target_original_vc:
+        try:
+            # Check if target is still in a voice channel
+            if target_member.voice and target_member.voice.channel:
+                await target_member.move_to(target_original_vc)
+                print(f"[*] Moved {target_member.display_name} back to {target_original_vc.name}")
+            else:
+                print(f"[*] Target user left voice channel during prank")
+        except Exception as e:
+            print(f"[!] Error moving target user back: {e}")
     
     original_vc = saved_state['original_vc']
     
